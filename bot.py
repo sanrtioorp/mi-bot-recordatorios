@@ -2,13 +2,13 @@
 """
 Bot de Telegram para recordatorios diarios.
 Compatible con Python 3.13+
-Incluye selección de días y rango de horario (hora inicio - hora fin).
+Funciones: días, horario inicio/fin, notas, recordatorio exacto, estadísticas, rachas.
 """
 
 import json
 import logging
 import os
-from datetime import datetime
+from datetime import datetime, date
 
 import telebot
 from telebot.types import InlineKeyboardMarkup, InlineKeyboardButton
@@ -22,6 +22,7 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 bot = telebot.TeleBot(TOKEN)
+scheduler = BackgroundScheduler(timezone="America/Argentina/Buenos_Aires")
 
 CATEGORIES = {
     "trabajo":   "💼 Trabajo / Reuniones",
@@ -30,21 +31,12 @@ CATEGORIES = {
 }
 
 DAYS = {
-    "lun": "Lunes",
-    "mar": "Martes",
-    "mie": "Miércoles",
-    "jue": "Jueves",
-    "vie": "Viernes",
-    "sab": "Sábado",
-    "dom": "Domingo",
+    "lun": "Lunes", "mar": "Martes", "mie": "Miércoles",
+    "jue": "Jueves", "vie": "Viernes", "sab": "Sábado", "dom": "Domingo",
 }
+DAY_INDEX = {"lun":0,"mar":1,"mie":2,"jue":3,"vie":4,"sab":5,"dom":6}
 
-DAY_INDEX = {
-    "lun": 0, "mar": 1, "mie": 2,
-    "jue": 3, "vie": 4, "sab": 5, "dom": 6,
-}
-
-user_state = {}  # user_id -> {"step": ..., "data": {...}}
+user_state = {}
 
 # ── Persistencia ───────────────────────────────────────────────────────────────
 
@@ -58,12 +50,36 @@ def save_data(data):
     with open(DATA_FILE, "w", encoding="utf-8") as f:
         json.dump(data, f, ensure_ascii=False, indent=2)
 
+def get_user(user_id):
+    data = load_data()
+    uid = str(user_id)
+    if uid not in data:
+        data[uid] = {"tasks": [], "stats": {"completadas_total": 0, "dias_completos": 0, "racha": 0, "ultima_fecha": None}}
+        save_data(data)
+    if "tasks" not in data[uid]:
+        data[uid] = {"tasks": data[uid] if isinstance(data[uid], list) else [], "stats": {"completadas_total": 0, "dias_completos": 0, "racha": 0, "ultima_fecha": None}}
+        save_data(data)
+    return data[uid]
+
 def get_tasks(user_id):
-    return load_data().get(str(user_id), [])
+    return get_user(user_id)["tasks"]
 
 def save_tasks(user_id, tasks):
     data = load_data()
-    data[str(user_id)] = tasks
+    uid = str(user_id)
+    if uid not in data or "tasks" not in data.get(uid, {}):
+        data[uid] = {"tasks": tasks, "stats": {"completadas_total": 0, "dias_completos": 0, "racha": 0, "ultima_fecha": None}}
+    else:
+        data[uid]["tasks"] = tasks
+    save_data(data)
+
+def get_stats(user_id):
+    return get_user(user_id).get("stats", {})
+
+def save_stats(user_id, stats):
+    data = load_data()
+    uid = str(user_id)
+    data[uid]["stats"] = stats
     save_data(data)
 
 # ── Helpers ────────────────────────────────────────────────────────────────────
@@ -97,6 +113,41 @@ def valid_time(t):
     except ValueError:
         return False
 
+def schedule_task_reminder(user_id, task):
+    """Programa un recordatorio exacto para una tarea."""
+    hora = task.get("hora")
+    if not hora:
+        return
+    h, m = map(int, hora.split(":"))
+    dias = task.get("dias", list(DAY_INDEX.keys()))
+    day_of_week = ",".join(str(DAY_INDEX[d]) for d in dias)
+    job_id = f"task_{user_id}_{task['nombre'].replace(' ','_')}_{hora}"
+
+    # Evitar duplicados
+    if scheduler.get_job(job_id):
+        scheduler.remove_job(job_id)
+
+    def send_reminder():
+        hora_fin_str = f" → {task['hora_fin']}" if task.get("hora_fin") else ""
+        nota_str = f"\n📝 _{task['nota']}_" if task.get("nota") else ""
+        bot.send_message(int(user_id),
+            f"🔔 *Recordatorio:* {task['nombre']}\n"
+            f"⏰ {task['hora']}{hora_fin_str}{nota_str}",
+            parse_mode="Markdown"
+        )
+
+    scheduler.add_job(send_reminder, trigger="cron",
+                      day_of_week=day_of_week, hour=h, minute=m,
+                      id=job_id, replace_existing=True)
+
+def reschedule_all():
+    """Reprograma todos los recordatorios al iniciar."""
+    data = load_data()
+    for user_id, udata in data.items():
+        tasks = udata.get("tasks", []) if isinstance(udata, dict) else udata
+        for task in tasks:
+            schedule_task_reminder(user_id, task)
+
 # ── /start ─────────────────────────────────────────────────────────────────────
 
 @bot.message_handler(commands=["start", "ayuda", "help"])
@@ -108,8 +159,9 @@ def cmd_start(message):
         "/listar — Ver tus actividades\n"
         "/eliminar — Eliminar una actividad\n"
         "/completadas — Marcar tareas del día\n"
+        "/estadisticas — Ver tu progreso\n"
         "/ayuda — Mostrar esta ayuda\n\n"
-        "⏰ Recibirás un recordatorio cada mañana con las tareas del día.",
+        "⏰ Recibirás un resumen a las 7AM y recordatorios a la hora exacta de cada tarea.",
         parse_mode="Markdown"
     )
 
@@ -130,10 +182,11 @@ def cmd_listar(message):
             for t in cat_tasks:
                 done = "✅" if t.get("completada_hoy") else "⬜"
                 dias = days_label(t.get("dias", list(DAY_INDEX.keys())))
-                hora_fin = f" → {t['hora_fin']}" if t.get("hora_fin") else ""
-                msg += f"  {done} {t['nombre']}\n"
-                msg += f"       ⏰ {t['hora']}{hora_fin}\n"
-                msg += f"       📅 {dias}\n"
+                hora_fin_str = f" → {t['hora_fin']}" if t.get("hora_fin") else ""
+                nota_str = f"\n       📝 {t['nota']}" if t.get("nota") else ""
+                msg += f"  {done} *{t['nombre']}*\n"
+                msg += f"       ⏰ {t['hora']}{hora_fin_str}\n"
+                msg += f"       📅 {dias}{nota_str}\n"
             msg += "\n"
     bot.send_message(message.chat.id, msg, parse_mode="Markdown")
 
@@ -165,7 +218,7 @@ def recibir_hora_inicio(message):
     user_state[message.from_user.id]["data"]["hora"] = hora
     user_state[message.from_user.id]["step"] = "hora_fin"
     bot.send_message(message.chat.id,
-        "⏰ *¿A qué hora termina?*\n_(Formato 24hs, ej: 09:30 — o escribí *no* si no tiene hora de fin)_",
+        "⏰ *¿A qué hora termina?*\n_(ej: 09:30 — o escribí *no* si no tiene hora de fin)_",
         parse_mode="Markdown"
     )
 
@@ -176,14 +229,23 @@ def recibir_hora_fin(message):
         user_state[message.from_user.id]["data"]["hora_fin"] = None
     else:
         if not valid_time(texto):
-            bot.send_message(message.chat.id, "❌ Formato inválido. Usá HH:MM (ej: 09:30) o escribí *no*", parse_mode="Markdown")
+            bot.send_message(message.chat.id, "❌ Formato inválido. Usá HH:MM o escribí *no*", parse_mode="Markdown")
             return
         user_state[message.from_user.id]["data"]["hora_fin"] = texto
+    user_state[message.from_user.id]["step"] = "nota"
+    bot.send_message(message.chat.id,
+        "📝 *¿Querés agregar una nota?*\n_(Ej: Llevar auriculares, Ropa deportiva — o escribí *no*)_",
+        parse_mode="Markdown"
+    )
 
+@bot.message_handler(func=lambda m: m.from_user.id in user_state and user_state[m.from_user.id]["step"] == "nota")
+def recibir_nota(message):
+    texto = message.text.strip()
+    user_state[message.from_user.id]["data"]["nota"] = None if texto.lower() == "no" else texto
     user_state[message.from_user.id]["data"]["dias_sel"] = []
     user_state[message.from_user.id]["step"] = "dias"
     bot.send_message(message.chat.id,
-        "📅 *¿Qué días aplica esta actividad?*\nSeleccioná los días y tocá *Confirmar*.",
+        "📅 *¿Qué días aplica?*\nSeleccioná los días y tocá *Confirmar*.",
         reply_markup=build_days_kb([]),
         parse_mode="Markdown"
     )
@@ -241,17 +303,22 @@ def recibir_categoria(call):
     tasks = get_tasks(uid)
     tasks.append(tarea)
     save_tasks(uid, tasks)
+
+    # Programar recordatorio exacto
+    schedule_task_reminder(str(uid), tarea)
+
     del user_state[uid]
 
     dias_str = days_label(tarea.get("dias", list(DAY_INDEX.keys())))
     hora_fin_str = f" → {tarea['hora_fin']}" if tarea.get("hora_fin") else ""
+    nota_str = f"\n📝 {tarea['nota']}" if tarea.get("nota") else ""
 
     bot.edit_message_text(
         f"✅ *¡Actividad guardada!*\n\n"
         f"📌 {tarea['nombre']}\n"
         f"⏰ {tarea['hora']}{hora_fin_str}\n"
         f"📅 {dias_str}\n"
-        f"📂 {CATEGORIES[cat_key]}",
+        f"📂 {CATEGORIES[cat_key]}{nota_str}",
         call.message.chat.id, call.message.message_id, parse_mode="Markdown"
     )
     bot.answer_callback_query(call.id)
@@ -289,6 +356,10 @@ def confirmar_eliminacion(call):
     if 0 <= idx < len(tasks):
         eliminada = tasks.pop(idx)
         save_tasks(uid, tasks)
+        # Remover job del scheduler
+        job_id = f"task_{uid}_{eliminada['nombre'].replace(' ','_')}_{eliminada['hora']}"
+        if scheduler.get_job(job_id):
+            scheduler.remove_job(job_id)
         bot.edit_message_text(
             f"🗑 Eliminada: *{eliminada['nombre']}*",
             call.message.chat.id, call.message.message_id, parse_mode="Markdown"
@@ -325,7 +396,27 @@ def toggle_completada(call):
     tasks = get_tasks(uid)
 
     if call.data == "close":
-        bot.edit_message_text("👍 ¡Listo!", call.message.chat.id, call.message.message_id)
+        # Verificar si todas las tareas de hoy están completas → actualizar racha
+        hoy = datetime.now().weekday()
+        dia_key = ["lun","mar","mie","jue","vie","sab","dom"][hoy]
+        tareas_hoy = [t for t in tasks if dia_key in t.get("dias", list(DAY_INDEX.keys()))]
+        todas_completas = tareas_hoy and all(t.get("completada_hoy") for t in tareas_hoy)
+
+        if todas_completas:
+            stats = get_stats(uid)
+            hoy_str = date.today().isoformat()
+            if stats.get("ultima_fecha") != hoy_str:
+                stats["completadas_total"] = stats.get("completadas_total", 0) + len(tareas_hoy)
+                stats["dias_completos"] = stats.get("dias_completos", 0) + 1
+                stats["racha"] = stats.get("racha", 0) + 1
+                stats["ultima_fecha"] = hoy_str
+                save_stats(uid, stats)
+            bot.edit_message_text(
+                f"🎉 *¡Completaste todas las tareas de hoy!*\n🔥 Racha actual: {stats['racha']} día(s)",
+                call.message.chat.id, call.message.message_id, parse_mode="Markdown"
+            )
+        else:
+            bot.edit_message_text("👍 ¡Listo!", call.message.chat.id, call.message.message_id)
         bot.answer_callback_query(call.id)
         return
 
@@ -336,20 +427,68 @@ def toggle_completada(call):
         idx = int(call.data.replace("toggle_", ""))
         if 0 <= idx < len(tasks):
             tasks[idx]["completada_hoy"] = not tasks[idx].get("completada_hoy", False)
+            # Actualizar stats de completadas
+            if tasks[idx]["completada_hoy"]:
+                stats = get_stats(uid)
+                stats["completadas_total"] = stats.get("completadas_total", 0) + 1
+                save_stats(uid, stats)
 
     save_tasks(uid, tasks)
     bot.edit_message_reply_markup(call.message.chat.id, call.message.message_id,
                                    reply_markup=build_completadas_kb(tasks))
     bot.answer_callback_query(call.id)
 
-# ── Recordatorio diario ────────────────────────────────────────────────────────
+# ── /estadisticas ──────────────────────────────────────────────────────────────
+
+@bot.message_handler(commands=["estadisticas"])
+def cmd_estadisticas(message):
+    uid = message.from_user.id
+    stats = get_stats(uid)
+    tasks = get_tasks(uid)
+
+    total_tareas = len(tasks)
+    completadas_total = stats.get("completadas_total", 0)
+    dias_completos = stats.get("dias_completos", 0)
+    racha = stats.get("racha", 0)
+
+    # Racha emoji
+    if racha >= 7:
+        racha_emoji = "🔥🔥🔥"
+    elif racha >= 3:
+        racha_emoji = "🔥🔥"
+    elif racha >= 1:
+        racha_emoji = "🔥"
+    else:
+        racha_emoji = "💤"
+
+    msg = (
+        "📊 *Tus estadísticas:*\n\n"
+        f"📌 Actividades registradas: *{total_tareas}*\n"
+        f"✅ Tareas completadas en total: *{completadas_total}*\n"
+        f"📅 Días con todas las tareas completas: *{dias_completos}*\n"
+        f"🔥 Racha actual: *{racha} día(s)* {racha_emoji}\n"
+    )
+
+    if racha == 0:
+        msg += "\n💡 _¡Completá todas las tareas de hoy para empezar tu racha!_"
+    elif racha < 3:
+        msg += "\n💡 _¡Vas bien, seguí así!_"
+    elif racha < 7:
+        msg += "\n💡 _¡Excelente constancia!_"
+    else:
+        msg += "\n💡 _¡Sos una máquina! Llevás más de una semana seguida._"
+
+    bot.send_message(message.chat.id, msg, parse_mode="Markdown")
+
+# ── Recordatorio diario 7AM ────────────────────────────────────────────────────
 
 def enviar_recordatorio_diario():
     hoy = datetime.now().weekday()
     dia_key = ["lun","mar","mie","jue","vie","sab","dom"][hoy]
 
     data = load_data()
-    for user_id, tasks in data.items():
+    for user_id, udata in data.items():
+        tasks = udata.get("tasks", []) if isinstance(udata, dict) else udata
         tareas_hoy = [t for t in tasks if dia_key in t.get("dias", list(DAY_INDEX.keys()))]
         if not tareas_hoy:
             continue
@@ -361,25 +500,32 @@ def enviar_recordatorio_diario():
                 msg += f"*{cat_label}*\n"
                 for t in cat_tasks:
                     hora_fin_str = f" → {t['hora_fin']}" if t.get("hora_fin") else ""
-                    msg += f"  ⬜ {t['nombre']} — {t['hora']}{hora_fin_str}\n"
+                    nota_str = f" _{t['nota']}_" if t.get("nota") else ""
+                    msg += f"  ⬜ {t['nombre']} — {t['hora']}{hora_fin_str}{nota_str}\n"
                 msg += "\n"
         msg += "Usá /completadas para marcar lo que vayas haciendo 💪"
 
         for t in tasks:
             t["completada_hoy"] = False
-        save_tasks(user_id, tasks)
+        if isinstance(udata, dict):
+            udata["tasks"] = tasks
+            data[user_id] = udata
+        else:
+            data[user_id] = tasks
 
         try:
             bot.send_message(int(user_id), msg, parse_mode="Markdown")
         except Exception as e:
             logger.warning(f"No se pudo enviar a {user_id}: {e}")
 
+    save_data(data)
+
 # ── Main ───────────────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
-    scheduler = BackgroundScheduler(timezone="America/Argentina/Buenos_Aires")
-    scheduler.add_job(enviar_recordatorio_diario, trigger="cron", hour=7, minute=0)
+    reschedule_all()
+    scheduler.add_job(enviar_recordatorio_diario, trigger="cron", hour=7, minute=0, id="daily_summary")
     scheduler.start()
 
-    logger.info("✅ Bot iniciado. Esperando mensajes...")
+    logger.info("✅ Bot iniciado con todas las funciones. Esperando mensajes...")
     bot.infinity_polling()
