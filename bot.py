@@ -2,7 +2,7 @@
 """
 Bot de Telegram para recordatorios diarios.
 Compatible con Python 3.13+
-Usa pyTelegramBotAPI + APScheduler
+Incluye selección de días y rango de horario (hora inicio - hora fin).
 """
 
 import json
@@ -29,8 +29,22 @@ CATEGORIES = {
     "habitos":   "🌱 Hábitos Personales",
 }
 
-# Estado temporal para el flujo de agregar tarea
-user_state = {}   # user_id -> {"step": ..., "data": {...}}
+DAYS = {
+    "lun": "Lunes",
+    "mar": "Martes",
+    "mie": "Miércoles",
+    "jue": "Jueves",
+    "vie": "Viernes",
+    "sab": "Sábado",
+    "dom": "Domingo",
+}
+
+DAY_INDEX = {
+    "lun": 0, "mar": 1, "mie": 2,
+    "jue": 3, "vie": 4, "sab": 5, "dom": 6,
+}
+
+user_state = {}  # user_id -> {"step": ..., "data": {...}}
 
 # ── Persistencia ───────────────────────────────────────────────────────────────
 
@@ -52,6 +66,37 @@ def save_tasks(user_id, tasks):
     data[str(user_id)] = tasks
     save_data(data)
 
+# ── Helpers ────────────────────────────────────────────────────────────────────
+
+def days_label(days_list):
+    if sorted(days_list) == sorted(DAY_INDEX.keys()):
+        return "Todos los días"
+    return ", ".join(DAYS[d] for d in ["lun","mar","mie","jue","vie","sab","dom"] if d in days_list)
+
+def build_days_kb(selected):
+    kb = InlineKeyboardMarkup()
+    row = []
+    for key, label in DAYS.items():
+        check = "✅" if key in selected else "⬜"
+        row.append(InlineKeyboardButton(f"{check} {label[:3]}", callback_data=f"day_{key}"))
+        if len(row) == 4:
+            kb.row(*row)
+            row = []
+    if row:
+        kb.row(*row)
+    kb.row(
+        InlineKeyboardButton("☑️ Todos", callback_data="day_all"),
+        InlineKeyboardButton("✅ Confirmar", callback_data="day_confirm")
+    )
+    return kb
+
+def valid_time(t):
+    try:
+        datetime.strptime(t, "%H:%M")
+        return True
+    except ValueError:
+        return False
+
 # ── /start ─────────────────────────────────────────────────────────────────────
 
 @bot.message_handler(commands=["start", "ayuda", "help"])
@@ -64,7 +109,7 @@ def cmd_start(message):
         "/eliminar — Eliminar una actividad\n"
         "/completadas — Marcar tareas del día\n"
         "/ayuda — Mostrar esta ayuda\n\n"
-        "⏰ Recibirás un resumen cada mañana a las 7:00 AM.",
+        "⏰ Recibirás un recordatorio cada mañana con las tareas del día.",
         parse_mode="Markdown"
     )
 
@@ -84,45 +129,101 @@ def cmd_listar(message):
             msg += f"*{cat_label}*\n"
             for t in cat_tasks:
                 done = "✅" if t.get("completada_hoy") else "⬜"
-                msg += f"  {done} {t['nombre']} — {t['hora']}\n"
+                dias = days_label(t.get("dias", list(DAY_INDEX.keys())))
+                hora_fin = f" → {t['hora_fin']}" if t.get("hora_fin") else ""
+                msg += f"  {done} {t['nombre']}\n"
+                msg += f"       ⏰ {t['hora']}{hora_fin}\n"
+                msg += f"       📅 {dias}\n"
             msg += "\n"
     bot.send_message(message.chat.id, msg, parse_mode="Markdown")
 
-# ── /agregar (flujo por pasos) ─────────────────────────────────────────────────
+# ── /agregar ───────────────────────────────────────────────────────────────────
 
 @bot.message_handler(commands=["agregar"])
 def cmd_agregar(message):
     user_state[message.from_user.id] = {"step": "nombre", "data": {}}
     bot.send_message(message.chat.id,
-        "📝 ¿Cómo se llama la actividad?\n_(Ej: Reunión de equipo, Salir a correr)_",
+        "📝 *¿Cómo se llama la actividad?*\n_(Ej: Reunión de equipo, Salir a correr)_",
         parse_mode="Markdown"
     )
 
 @bot.message_handler(func=lambda m: m.from_user.id in user_state and user_state[m.from_user.id]["step"] == "nombre")
 def recibir_nombre(message):
     user_state[message.from_user.id]["data"]["nombre"] = message.text.strip()
-    user_state[message.from_user.id]["step"] = "hora"
+    user_state[message.from_user.id]["step"] = "hora_inicio"
     bot.send_message(message.chat.id,
-        "⏰ ¿A qué hora? _(Formato 24hs, ej: 08:30 o 20:00)_",
+        "⏰ *¿A qué hora empieza?*\n_(Formato 24hs, ej: 08:30)_",
         parse_mode="Markdown"
     )
 
-@bot.message_handler(func=lambda m: m.from_user.id in user_state and user_state[m.from_user.id]["step"] == "hora")
-def recibir_hora(message):
+@bot.message_handler(func=lambda m: m.from_user.id in user_state and user_state[m.from_user.id]["step"] == "hora_inicio")
+def recibir_hora_inicio(message):
     hora = message.text.strip()
-    try:
-        datetime.strptime(hora, "%H:%M")
-    except ValueError:
+    if not valid_time(hora):
         bot.send_message(message.chat.id, "❌ Formato inválido. Usá HH:MM (ej: 08:30)")
         return
-
     user_state[message.from_user.id]["data"]["hora"] = hora
-    user_state[message.from_user.id]["step"] = "categoria"
+    user_state[message.from_user.id]["step"] = "hora_fin"
+    bot.send_message(message.chat.id,
+        "⏰ *¿A qué hora termina?*\n_(Formato 24hs, ej: 09:30 — o escribí *no* si no tiene hora de fin)_",
+        parse_mode="Markdown"
+    )
 
-    kb = InlineKeyboardMarkup()
-    for key, label in CATEGORIES.items():
-        kb.add(InlineKeyboardButton(label, callback_data=f"cat_{key}"))
-    bot.send_message(message.chat.id, "📂 ¿En qué categoría?", reply_markup=kb)
+@bot.message_handler(func=lambda m: m.from_user.id in user_state and user_state[m.from_user.id]["step"] == "hora_fin")
+def recibir_hora_fin(message):
+    texto = message.text.strip().lower()
+    if texto == "no":
+        user_state[message.from_user.id]["data"]["hora_fin"] = None
+    else:
+        if not valid_time(texto):
+            bot.send_message(message.chat.id, "❌ Formato inválido. Usá HH:MM (ej: 09:30) o escribí *no*", parse_mode="Markdown")
+            return
+        user_state[message.from_user.id]["data"]["hora_fin"] = texto
+
+    user_state[message.from_user.id]["data"]["dias_sel"] = []
+    user_state[message.from_user.id]["step"] = "dias"
+    bot.send_message(message.chat.id,
+        "📅 *¿Qué días aplica esta actividad?*\nSeleccioná los días y tocá *Confirmar*.",
+        reply_markup=build_days_kb([]),
+        parse_mode="Markdown"
+    )
+
+@bot.callback_query_handler(func=lambda c: c.data.startswith("day_"))
+def manejar_dias(call):
+    uid = call.from_user.id
+    if uid not in user_state or user_state[uid]["step"] != "dias":
+        bot.answer_callback_query(call.id)
+        return
+
+    selected = user_state[uid]["data"].get("dias_sel", [])
+    action = call.data.replace("day_", "")
+
+    if action == "all":
+        selected = list(DAY_INDEX.keys())
+    elif action == "confirm":
+        if not selected:
+            bot.answer_callback_query(call.id, "⚠️ Seleccioná al menos un día.", show_alert=True)
+            return
+        user_state[uid]["data"]["dias"] = selected
+        user_state[uid]["step"] = "categoria"
+        kb = InlineKeyboardMarkup()
+        for key, label in CATEGORIES.items():
+            kb.add(InlineKeyboardButton(label, callback_data=f"cat_{key}"))
+        bot.edit_message_text("📂 *¿En qué categoría?*",
+                              call.message.chat.id, call.message.message_id,
+                              reply_markup=kb, parse_mode="Markdown")
+        bot.answer_callback_query(call.id)
+        return
+    else:
+        if action in selected:
+            selected.remove(action)
+        else:
+            selected.append(action)
+
+    user_state[uid]["data"]["dias_sel"] = selected
+    bot.edit_message_reply_markup(call.message.chat.id, call.message.message_id,
+                                   reply_markup=build_days_kb(selected))
+    bot.answer_callback_query(call.id)
 
 @bot.callback_query_handler(func=lambda c: c.data.startswith("cat_"))
 def recibir_categoria(call):
@@ -135,14 +236,22 @@ def recibir_categoria(call):
     tarea = user_state[uid]["data"]
     tarea["categoria"] = cat_key
     tarea["completada_hoy"] = False
+    tarea.pop("dias_sel", None)
 
     tasks = get_tasks(uid)
     tasks.append(tarea)
     save_tasks(uid, tasks)
     del user_state[uid]
 
+    dias_str = days_label(tarea.get("dias", list(DAY_INDEX.keys())))
+    hora_fin_str = f" → {tarea['hora_fin']}" if tarea.get("hora_fin") else ""
+
     bot.edit_message_text(
-        f"✅ *Guardado:*\n📌 {tarea['nombre']}\n⏰ {tarea['hora']}\n📂 {CATEGORIES[cat_key]}",
+        f"✅ *¡Actividad guardada!*\n\n"
+        f"📌 {tarea['nombre']}\n"
+        f"⏰ {tarea['hora']}{hora_fin_str}\n"
+        f"📅 {dias_str}\n"
+        f"📂 {CATEGORIES[cat_key]}",
         call.message.chat.id, call.message.message_id, parse_mode="Markdown"
     )
     bot.answer_callback_query(call.id)
@@ -158,7 +267,11 @@ def cmd_eliminar(message):
 
     kb = InlineKeyboardMarkup()
     for i, t in enumerate(tasks):
-        kb.add(InlineKeyboardButton(f"🗑 {t['nombre']} ({t['hora']})", callback_data=f"del_{i}"))
+        hora_fin_str = f" → {t['hora_fin']}" if t.get("hora_fin") else ""
+        kb.add(InlineKeyboardButton(
+            f"🗑 {t['nombre']} ({t['hora']}{hora_fin_str})",
+            callback_data=f"del_{i}"
+        ))
     kb.add(InlineKeyboardButton("❌ Cancelar", callback_data="del_cancel"))
     bot.send_message(message.chat.id, "¿Qué actividad querés eliminar?", reply_markup=kb)
 
@@ -188,7 +301,11 @@ def build_completadas_kb(tasks):
     kb = InlineKeyboardMarkup()
     for i, t in enumerate(tasks):
         estado = "✅" if t.get("completada_hoy") else "⬜"
-        kb.add(InlineKeyboardButton(f"{estado} {t['nombre']} ({t['hora']})", callback_data=f"toggle_{i}"))
+        hora_fin_str = f" → {t['hora_fin']}" if t.get("hora_fin") else ""
+        kb.add(InlineKeyboardButton(
+            f"{estado} {t['nombre']} ({t['hora']}{hora_fin_str})",
+            callback_data=f"toggle_{i}"
+        ))
     kb.add(InlineKeyboardButton("🔄 Resetear todas", callback_data="reset_all"))
     kb.add(InlineKeyboardButton("✖ Cerrar", callback_data="close"))
     return kb
@@ -228,17 +345,23 @@ def toggle_completada(call):
 # ── Recordatorio diario ────────────────────────────────────────────────────────
 
 def enviar_recordatorio_diario():
+    hoy = datetime.now().weekday()
+    dia_key = ["lun","mar","mie","jue","vie","sab","dom"][hoy]
+
     data = load_data()
     for user_id, tasks in data.items():
-        if not tasks:
+        tareas_hoy = [t for t in tasks if dia_key in t.get("dias", list(DAY_INDEX.keys()))]
+        if not tareas_hoy:
             continue
-        msg = "☀️ *¡Buenos días! Tus actividades de hoy:*\n\n"
+
+        msg = f"☀️ *¡Buenos días! Tus actividades de hoy ({DAYS[dia_key]}):*\n\n"
         for cat_key, cat_label in CATEGORIES.items():
-            cat_tasks = [t for t in tasks if t["categoria"] == cat_key]
+            cat_tasks = [t for t in tareas_hoy if t["categoria"] == cat_key]
             if cat_tasks:
                 msg += f"*{cat_label}*\n"
                 for t in cat_tasks:
-                    msg += f"  ⬜ {t['nombre']} — {t['hora']}\n"
+                    hora_fin_str = f" → {t['hora_fin']}" if t.get("hora_fin") else ""
+                    msg += f"  ⬜ {t['nombre']} — {t['hora']}{hora_fin_str}\n"
                 msg += "\n"
         msg += "Usá /completadas para marcar lo que vayas haciendo 💪"
 
